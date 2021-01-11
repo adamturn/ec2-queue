@@ -20,12 +20,12 @@ class Payload(object):
         self.cmd = cmd
         self.prf = prf
         self.pause = lambda x: time.sleep(random() * x)  # 0 to x seconds
-        self.tblname = "app_ec2_queue"
-        self.tblcols = {"id": "text", "app_lock": "bool", "queue": "integer", "last_update": "timestamp"}
+        self.log = "app_ec2q_log"
+        self.tbl = "app_ec2q_tbl"
 
     @classmethod
     def from_sys_args(cls, sysargs):
-        """Convenience constructor.
+        """Convenience constructor returning an instance of Payload.
 
         Args:
             sysargs: expects sys.argv list
@@ -53,36 +53,19 @@ class Payload(object):
                 response = json.load(buffer)
         return response
 
-    def __aws_ec2_start(self):
+    def __aws_ec2_cmd(self):
+        if self.cmd == "start":
+            requested_state, anti_state = "running", "stopped"
+        elif self.cmd == "stop":
+            requested_state, anti_state = "stopped", "running"
         response = self.__aws_ec2_describe()
         state = response["InstanceStatuses"]["InstanceState"]["Name"]
-        timeout = time.time() + 60  # 1 minute from now
-        while state != "running" or time.time() > timeout:
-            if state == "stopped":
+        timeout = time.time() + (60 * 2)  # 2 minutes from now
+        while state != requested_state or time.time() <= timeout:
+            if state == anti_state:
                 try:
                     subprocess.run(
-                        args=["aws", "ec2", "start-instances", "--instance-ids", self.ec2, "--profile", self.prf],
-                        check=True
-                    )
-                except subprocess.CalledProcessError as err:
-                    self.__aws_cli_error()
-                    raise err
-            elif state in ("shutting-down", "terminated"):
-                raise ValueError("This AWS EC2 instance is " + state)
-            self.pause(5)
-            response = self.__aws_ec2_describe()
-            state = response["InstanceStatuses"]["InstanceState"]["Name"]
-        return self
-
-    def __aws_ec2_stop(self):
-        response = self.__aws_ec2_describe()
-        state = response["InstanceStatuses"]["InstanceState"]["Name"]
-        timeout = time.time() + 60  # 1 minute from now
-        while state != "stopped" or time.time() > timeout:
-            if state == "running":
-                try:
-                    subprocess.run(
-                        args=["aws", "ec2", "stop-instances", "--instance-ids", self.ec2, "--profile", self.prf],
+                        args=["aws", "ec2", f"{self.cmd}-instances", "--instance-ids", self.ec2, "--profile", self.prf],
                         check=True
                     )
                 except subprocess.CalledProcessError as err:
@@ -93,61 +76,103 @@ class Payload(object):
             self.pause(5)
             response = self.__aws_ec2_describe()
             state = response["InstanceStatuses"]["InstanceState"]["Name"]
-        return self
-
-    def __handle_app_lock(self, curs):
-        result = curs.fetchone()
-        app_lock = result[2]
-        timeout = time.time() + (60 * 5)  # 5 minutes from now
-        while app_lock or time.time() > timeout:
-            self.pause(5)
-            curs.execute()
-            result = curs.fetchone()
-            app_lock = result[2]
         if time.time() > timeout:
-            raise TimeoutError("Waited over 5 min for the app to unlock!")
+            raise TimeoutError(f"Exceeded time limit for this instance to {self.cmd}!")
         else:
-            return result
+            return self
 
-    def __update_queue(self, queue, conn):
+    def __queue_then_lock(self, conn):
         with conn.cursor() as curs:
-            query = sql.SQL(
-                "UPDATE {} SET queue = %s, app_lock = True WHERE id = %s;".format(sql.Identifier(self.tblname))
-            )
-            curs.execute(query, (queue, self.ec2))
+            query = sql.SQL("SELECT * FROM {} WHERE id = %s;").format(sql.Identifier(self.tbl))
+            curs.execute(query, (self.ec2,))
+            # if we have this id
+            if curs.rowcount == 1:
+                record = curs.fetchone()
+                app_lock = record[2]  # cols: id, queue, app_lock, last_update
+                timeout = time.time() + (60 * 5)  # 5 minutes from now
+                # queue until app is unlocked
+                while app_lock or time.time() > timeout:
+                    self.pause(5)
+                    curs.execute()
+                    record = curs.fetchone()
+                    app_lock = record[2]
+                if time.time() > timeout:
+                    raise TimeoutError("Waited over 5 min for the app to unlock!")
+                elif self.cmd == "start":
+                    with conn.cursor() as curs:
+                        query = sql.SQL(
+                            "UPDATE {} SET queue = %s, app_lock = TRUE WHERE id = %s;".format(sql.Identifier(self.tbl))
+                        )
+                        queue = record[1] + 1
+                        curs.execute(query, (queue, self.ec2))
+                elif self.cmd == "stop":
+                    with conn.cursor() as curs:
+                        query = sql.SQL(
+                            "UPDATE {} SET queue = %s, app_lock = TRUE WHERE id = %s;".format(sql.Identifier(self.tbl))
+                        )
+                        queue = record[1] - 1
+                        curs.execute(query, (queue, self.ec2))
+            # no id start: insert new record with queue and lock
+            elif self.cmd == "start":
+                with conn.cursor() as curs:
+                    query = sql.SQL("INSERT INTO {} VALUES (%s, %s, %s);").format(sql.Identifier(self.tbl))
+                    curs.execute(query, (self.ec2, 1, True))
+            # no id stop: insert new record with no queue and lock
+            elif self.cmd == "stop":
+                with conn.cursor() as curs:
+                    query = sql.SQL("INSERT INTO {} VALUES (%s, %s, %s);").format(sql.Identifier(self.tbl))
+                    curs.execute(query, (self.ec2, 0, True))
         return self
 
-    def process_start_task(self, conn):
-        # check if we have this instance id
+    def __handle_new_ec2(self, conn):
         with conn.cursor() as curs:
-            curs.execute(sql.SQL("SELECT * FROM {} WHERE id = %s;").format(sql.Identifier(self.tblname)), (self.ec2,))
-            if curs.rowcount == 1:
-                result = self.__handle_app_lock(curs)
-                queue = result[1] + 1
-                self.__update_queue(queue, conn)
-            else:
-                with conn.cursor() as curs:
-                    query = sql.SQL("INSERT INTO {} VALUES (%s, %s);").format(sql.Identifier(self.tblname))
-                    curs.execute(query, (self.ec2, 1))
-        self.__aws_ec2_start()
+            query = sql.SQL("INSERT INTO {} VALUES (%s, %s, %s); SELECT * FROM {} WHERE id = %s").format(sql.Identifier(self.tbl))
+            values = (self.ec2, 0, True)
+            curs.execute(query, values)
+        return self
+
+    def handle_start_request(self, conn):
+        # then, check if queue == 0
+        # if so: send the start request
+        # regardless, queue ++
         with conn.cursor() as curs:
-            query = sql.SQL("UPDATE {} SET app_lock = %s WHERE id = %s;").format(sql.Identifier(self.tblname))
+            query = sql.SQL("SELECT * FROM {} WHERE id = ")
+        # self.__queue_then_lock(conn)
+        self.__aws_ec2_cmd()
+        # unlock
+        with conn.cursor() as curs:
+            query = sql.SQL("UPDATE {} SET app_lock = %s WHERE id = %s;").format(sql.Identifier(self.tbl))
             curs.execute(query, (False, self.ec2))
-                
         return self
     
     def process_stop_task(self, conn):
+        # we should have this id already
+        with conn.cursor() as curs:
+            curs.execute(sql.SQL("SELECT * FROM {} WHERE id = %s;").format(sql.Identifier(self.tbl)), (self.ec2,))
+            if curs.rowcount == 1:
+                # if we have it, then either the app is locked or it is not
+                # if it is locked, we need to wait for it to unlock
+                result = self.__queue_then_lock(curs)
+                # once it is unlocked
 
         return self
 
     def process_task(self, conn):
-        """Processes an Airflow task sending a start request to the AWS CLI.
+        """Processes an Airflow task sending a command to the AWS CLI.
 
         Args:
             conn: active Psycopg2 connection object
         """
+        with conn.cursor() as curs:
+            query = sql.SQL("SELECT * FROM {} WHERE id = %s;").format(sql.Identifier(self.tbl))
+            curs.execute(query, (self.ec2,))
+            record = curs.fetchone()
+
+        if not record:
+            self.__handle_new_ec2(conn)
+
         if self.cmd == "start":
-            self.process_start_task(conn)
+            self.handle_start_request(conn)
         elif self.cmd == "stop":
             self.process_stop_task(conn)
         else:

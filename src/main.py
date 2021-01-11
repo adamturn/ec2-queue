@@ -18,7 +18,7 @@ def main():
     dbconn = connect_postgres(props_path)
     p = Payload.from_sys_args(sys.argv)
     p.process_task(dbconn)
-    dbconn.close()
+    dbconn.close()  
 
     return None
 

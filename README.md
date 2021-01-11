@@ -1,5 +1,5 @@
 # EC2 Queue
-Wraps around the AWS CLI. Instead of having Airflow tasks submit EC2 start/stop commands directly to the AWS CLI, we could send start/stop requests to this EC2 Queue app instead. 
+Wraps around the AWS CLI. Instead of having Airflow tasks submit EC2 start/stop commands directly to the AWS CLI, consider sending requests to the EC2 Queue instead.
 
 Pass the EC2 instance id, AWS CLI command, and AWS CLI profile to `ec2`, `cmd` and `prf` arguments, respectively.
 
