@@ -8,7 +8,7 @@ import pathlib
 import re
 import sys
 # local modules
-from process_task import Payload
+from payload import Payload
 from conndb import connect_postgres
 
 
